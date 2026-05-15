@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Node / Vite
+node_modules/
+dist/
+build/
+.vite/
+out/
+coverage/
+
+# Secrets & local state — NEVER commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Deployment & local artifacts
+.vercel/
+*.db
+*.sqlite
+
+# Reports / demo outputs
+sample_output.pdf
+sample_output.xlsx

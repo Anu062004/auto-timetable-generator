@@ -1,0 +1,696 @@
+"""CP-SAT based timetable solver (Layer 3 of the blueprint). [v2]
+
+Encoding strategy:
+- For each section we expand its workload into a list of *tasks*:
+    THEORY  -> N independent 1-slot placements
+    LAB     -> M independent 2-slot placements (consecutive, no break crossing)
+    ACTIVITY-> N placements (possibly locked to specific (day, slot))
+- For each task we create one BoolVar per legal placement; exactly one is true.
+- Elective blocks reserve (day, slot) tuples globally across all sections.
+- Hard constraints H1..H12 are added as linear/boolean constraints.
+- Soft constraints S1..S7 are penalty terms in the objective.
+
+This keeps variable count linear and the model small enough to solve in
+seconds for the BMSIT 4th sem dataset (~6 sections, ~10 courses).
+"""
+from __future__ import annotations
+
+import math
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Optional
+
+from ortools.sat.python import cp_model
+
+from ..models.domain import (
+    Course,
+    CourseType,
+    ElectiveBlock,
+    Faculty,
+    ScheduledClass,
+    Section,
+    Timetable,
+    TimetableRequest,
+)
+
+# ---------------------------------------------------------------------------
+# Task representation
+# ---------------------------------------------------------------------------
+@dataclass
+class Task:
+    """A unit of work to place in a section's grid."""
+
+    section_id: str
+    course_code: str
+    kind: str  # "THEORY" | "LAB" | "ACTIVITY" | "ELECTIVE_RESERVE"
+    width: int  # 1 for theory/activity, 2 for lab
+    quantity: int  # number of placements per week (number of variable groups)
+    faculty_id: Optional[str] = None
+    batch_id: Optional[str] = None
+    paired_with: Optional[str] = None  # other course code for paired labs
+    lab_room: Optional[str] = None
+    preferred_slots: Optional[list[int]] = None
+    locked_day: Optional[str] = None
+    locked_slots: Optional[list[int]] = None
+    label: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _break_after(req: TimetableRequest) -> set[int]:
+    """Slot indices that have a break IMMEDIATELY after them.
+
+    A lab starting at slot t spans t and t+1; it spans a break if a break
+    sits between slots t and t+1, i.e., if t is in this set.
+    """
+    tc = req.time_config
+    return {tc.tea_break.after_slot, tc.lunch_break.after_slot}
+
+
+def _saturday_inactive(req: TimetableRequest) -> bool:
+    """Treat Saturday as fully inactive in the planar weekly model.
+
+    BMSIT has alternating Saturdays (1st & 3rd off). For the weekly grid
+    we model an *active* Saturday with fixed activities. To handle the
+    inactive ones, the consumer iterates calendar weeks; the solver only
+    cares about one canonical week.
+    """
+    sat_rules = req.time_config.saturday_rules
+    return len(sat_rules.locked_slots) == 0
+
+
+# ---------------------------------------------------------------------------
+# Solver
+# ---------------------------------------------------------------------------
+class TimetableSolver:
+    def __init__(self, req: TimetableRequest):
+        self.req = req
+        self.tc = req.time_config
+        self.days = list(self.tc.days)
+        self.slots = list(range(1, self.tc.slots_per_day + 1))
+        self.courses_by_code = {c.code: c for c in req.courses}
+        self.section_ids = [s.id for s in req.sections]
+        self.faculty_by_id = {f.id: f for f in req.faculty}
+
+        # Reserved cells: (section, day, slot) -> label (str)
+        # These cells are pre-filled (electives, activities locked, Saturday locks).
+        self._reserved: dict[tuple[str, str, int], ScheduledClass] = {}
+
+        # Faculty unavailability derived from reservations.
+        # (faculty_id, day, slot) -> True if blocked
+        self._faculty_blocked: set[tuple[str, str, int]] = set()
+
+        self._tasks_by_section: dict[str, list[Task]] = defaultdict(list)
+        self._break_after = _break_after(req)
+
+        # CP model
+        self.model = cp_model.CpModel()
+        # For each task we keep (task, var_dict) where var_dict maps (day, slot)->BoolVar.
+        # For LAB tasks "slot" is the START slot.
+        self._task_vars: list[tuple[Task, dict[tuple[str, int], cp_model.IntVar]]] = []
+
+        # All (section, day, slot, var, task) for clash/aggregation.
+        # For labs, the var contributes to TWO (day, slot) cells.
+        self._cell_contrib: dict[tuple[str, str, int], list[cp_model.IntVar]] = (
+            defaultdict(list)
+        )
+        # Faculty -> list of vars active at (day, slot)
+        self._fac_contrib: dict[tuple[str, str, int], list[cp_model.IntVar]] = (
+            defaultdict(list)
+        )
+        # Lab-room -> list of vars at (day, slot)
+        self._room_contrib: dict[tuple[str, str, int], list[cp_model.IntVar]] = (
+            defaultdict(list)
+        )
+        # Track all (task, day, slot, var) tuples for export
+        self._index: list[tuple[Task, str, int, cp_model.IntVar]] = []
+
+    # ------------------------------------------------------------------
+    # Reservations
+    # ------------------------------------------------------------------
+    def _reserve(self, sec_id: str, day: str, slot: int, sc: ScheduledClass) -> None:
+        self._reserved[(sec_id, day, slot)] = sc
+        if sc.faculty_id:
+            self._faculty_blocked.add((sc.faculty_id, day, slot))
+
+    def _apply_elective_blocks(self) -> None:
+        """Reserve global elective slots in every applying section.
+
+        Each section gets a label-only reservation ("DMS/OT") with no faculty
+        bound. ALL faculty in the combined pool (across options) are marked
+        unavailable for those (day, slot) cells so they cannot be scheduled
+        for other teaching during the elective block.
+        """
+        section_set = set(self.section_ids)
+        for block in self.req.elective_blocks:
+            applicable = [s for s in block.applies_to_sections if s in section_set]
+            if not applicable:
+                continue
+            globals_ = block.locked_global_slots
+            if not globals_:
+                globals_ = []
+                needed = block.weekly_slot_count
+                for d in self.days:
+                    if d == "SAT":
+                        continue
+                    for t in self.slots:
+                        if len(globals_) >= needed:
+                            break
+                        globals_.append((d, t))
+                    if len(globals_) >= needed:
+                        break
+
+            # Per-section reservation (label only)
+            for sec_id in applicable:
+                for (day, slot) in globals_:
+                    self._reserve(
+                        sec_id,
+                        day,
+                        slot,
+                        ScheduledClass(
+                            section_id=sec_id,
+                            course_code=block.id,
+                            faculty_id=None,
+                            day=day,
+                            slot=slot,
+                            label=block.name,
+                        ),
+                    )
+            # Block ALL pool faculty across options
+            pool_ids: set[str] = set()
+            for opt in block.options:
+                pool_ids.update(opt.faculty_pool)
+            for fid in pool_ids:
+                for (day, slot) in globals_:
+                    self._faculty_blocked.add((fid, day, slot))
+
+    def _apply_saturday_locks(self) -> None:
+        for ls in self.tc.saturday_rules.locked_slots:
+            applies = ls.applies_to_sections or self.section_ids
+            for sec_id in applies:
+                self._reserve(
+                    sec_id,
+                    ls.day,
+                    ls.slot,
+                    ScheduledClass(
+                        section_id=sec_id,
+                        course_code=ls.label,
+                        faculty_id=ls.faculty_id,
+                        day=ls.day,
+                        slot=ls.slot,
+                        label=ls.label,
+                    ),
+                )
+
+    def _apply_course_locks(self) -> None:
+        """Courses with locked_day + locked_slots (e.g., Dept-Activity)."""
+        for course in self.req.courses:
+            if not course.locked_day or not course.locked_slots:
+                continue
+            for sec_id in self.section_ids:
+                # Find faculty (optional) from assignments
+                fac_id = None
+                for f in self.req.faculty:
+                    for a in f.assignments:
+                        if a.course_code == course.code and a.section_id == sec_id:
+                            fac_id = f.id
+                            break
+                    if fac_id:
+                        break
+                for t in course.locked_slots:
+                    self._reserve(
+                        sec_id,
+                        course.locked_day,
+                        t,
+                        ScheduledClass(
+                            section_id=sec_id,
+                            course_code=course.code,
+                            faculty_id=fac_id,
+                            day=course.locked_day,
+                            slot=t,
+                            label=course.name,
+                        ),
+                    )
+
+    # ------------------------------------------------------------------
+    # Task generation
+    # ------------------------------------------------------------------
+    def _build_tasks(self) -> None:
+        """Convert the workload into placement tasks per section.
+
+        Each (faculty, course, section) assignment yields tasks based on the
+        course type. Courses that are part of an elective block are skipped
+        (already reserved). Courses with locked_day/locked_slots are skipped.
+        Paired labs are emitted as 2 LAB tasks per pair (sessions/week).
+        """
+        elective_course_codes: set[str] = set()
+        for b in self.req.elective_blocks:
+            for opt in b.options:
+                elective_course_codes.add(opt.course_code)
+
+        # Index assignments by (section, course, is_lab) -> faculty_id list
+        assignment_index: dict[tuple[str, str, bool], list[str]] = defaultdict(list)
+        for fac in self.req.faculty:
+            for a in fac.assignments:
+                assignment_index[(a.section_id, a.course_code, a.is_lab)].append(fac.id)
+
+        # Count cells already reserved per (section, course_code) so pinned
+        # classes count toward the workload and we don't schedule duplicates.
+        reserved_by_sec_course: dict[tuple[str, str], int] = defaultdict(int)
+        for (sec_id, _d, _t), sc in self._reserved.items():
+            reserved_by_sec_course[(sec_id, sc.course_code)] += 1
+
+        for sec in self.req.sections:
+            for course in self.req.courses:
+                if course.code in elective_course_codes:
+                    continue
+                if course.locked_day and course.locked_slots:
+                    continue  # already reserved
+
+                if course.type == CourseType.LAB:
+                    fac_ids = assignment_index.get((sec.id, course.code, True)) or \
+                              assignment_index.get((sec.id, course.code, False))
+                    if not fac_ids:
+                        continue
+                    sessions = max(course.effective_weekly_slots() // 2, 1)
+                    for s_idx in range(sessions):
+                        self._tasks_by_section[sec.id].append(
+                            Task(
+                                section_id=sec.id,
+                                course_code=course.code,
+                                kind="LAB",
+                                width=2,
+                                quantity=1,
+                                faculty_id=fac_ids[0],
+                                paired_with=course.pair_course,
+                                lab_room=course.lab_room,
+                                label=course.name,
+                            )
+                        )
+                elif course.type == CourseType.ACTIVITY:
+                    fac_ids = assignment_index.get((sec.id, course.code, False))
+                    fac_id = fac_ids[0] if fac_ids else None
+                    n = course.effective_weekly_slots()
+                    n -= reserved_by_sec_course.get((sec.id, course.code), 0)
+                    for _ in range(max(n, 0)):
+                        self._tasks_by_section[sec.id].append(
+                            Task(
+                                section_id=sec.id,
+                                course_code=course.code,
+                                kind="ACTIVITY",
+                                width=1,
+                                quantity=1,
+                                faculty_id=fac_id,
+                                preferred_slots=course.preferred_slots,
+                                label=course.name,
+                            )
+                        )
+                else:  # THEORY
+                    fac_ids = assignment_index.get((sec.id, course.code, False))
+                    if not fac_ids:
+                        continue
+                    n = course.effective_weekly_slots()
+                    n -= reserved_by_sec_course.get((sec.id, course.code), 0)
+                    for _ in range(max(n, 0)):
+                        self._tasks_by_section[sec.id].append(
+                            Task(
+                                section_id=sec.id,
+                                course_code=course.code,
+                                kind="THEORY",
+                                width=1,
+                                quantity=1,
+                                faculty_id=fac_ids[0],
+                                label=course.name,
+                            )
+                        )
+
+    # ------------------------------------------------------------------
+    # Variable creation
+    # ------------------------------------------------------------------
+    def _create_variables(self) -> None:
+        for sec_id, tasks in self._tasks_by_section.items():
+            for idx, task in enumerate(tasks):
+                var_map: dict[tuple[str, int], cp_model.IntVar] = {}
+                for d in self.days:
+                    # Saturday is reserved exclusively for the explicit locks
+                    # (IIC, BENGDIP2, etc.). No solver-placed task may land on
+                    # Saturday — this enforces the user rule "no class on
+                    # Saturday other than English / IIC / Dept-Activity".
+                    if d == "SAT":
+                        continue
+                    for t in self.slots:
+                        if task.width == 2:
+                            # Lab start: t and t+1 must both be valid and not span a break.
+                            if t + 1 not in self.slots:
+                                continue
+                            if t in self._break_after:
+                                continue
+                            # Both cells must be free of reservation.
+                            if (sec_id, d, t) in self._reserved:
+                                continue
+                            if (sec_id, d, t + 1) in self._reserved:
+                                continue
+                        else:
+                            if (sec_id, d, t) in self._reserved:
+                                continue
+                        # Locked-day check (activities/courses with locked_day only)
+                        if task.locked_day and d != task.locked_day:
+                            continue
+                        if task.locked_slots and t not in task.locked_slots:
+                            continue
+                        # Faculty unavailability
+                        if task.faculty_id:
+                            fac = self.faculty_by_id.get(task.faculty_id)
+                            if fac:
+                                if (task.faculty_id, d, t) in self._faculty_blocked:
+                                    continue
+                                if task.width == 2 and (task.faculty_id, d, t + 1) in self._faculty_blocked:
+                                    continue
+                                unav = {(u.day, u.slot) for u in fac.unavailable_slots}
+                                if (d, t) in unav:
+                                    continue
+                                if task.width == 2 and (d, t + 1) in unav:
+                                    continue
+                        v = self.model.NewBoolVar(f"x_{sec_id}_{task.course_code}_{idx}_{d}_{t}")
+                        var_map[(d, t)] = v
+                        # Cell contributions. For PAIRED labs only the
+                        # alphabetically-first course in the pair contributes,
+                        # because the two labs share the same (day, slot) for
+                        # the section grid (different batches, same cell).
+                        contributes_to_cell = not (
+                            task.kind == "LAB"
+                            and task.paired_with
+                            and task.course_code > task.paired_with
+                        )
+                        if contributes_to_cell:
+                            self._cell_contrib[(sec_id, d, t)].append(v)
+                            if task.width == 2:
+                                self._cell_contrib[(sec_id, d, t + 1)].append(v)
+                        # Faculty contributions
+                        if task.faculty_id:
+                            self._fac_contrib[(task.faculty_id, d, t)].append(v)
+                            if task.width == 2:
+                                self._fac_contrib[(task.faculty_id, d, t + 1)].append(v)
+                        # Room contributions
+                        if task.lab_room:
+                            self._room_contrib[(task.lab_room, d, t)].append(v)
+                            if task.width == 2:
+                                self._room_contrib[(task.lab_room, d, t + 1)].append(v)
+                        self._index.append((task, d, t, v))
+                if not var_map:
+                    raise RuntimeError(
+                        f"No legal placement for {task.kind} {task.course_code} in section {sec_id}"
+                    )
+                self._task_vars.append((task, var_map))
+
+    # ------------------------------------------------------------------
+    # Hard constraints
+    # ------------------------------------------------------------------
+    def _add_hard_constraints(self) -> None:
+        # H3: each task placed EXACTLY once
+        for task, var_map in self._task_vars:
+            self.model.Add(sum(var_map.values()) == 1)
+
+        # H2: section no-clash. Reserved cells already consume the slot;
+        # for non-reserved cells, at most 1 task may occupy it.
+        for (sec_id, d, t), vars_ in self._cell_contrib.items():
+            self.model.Add(sum(vars_) <= 1)
+
+        # H1: faculty no-clash. At most 1 simultaneous placement per faculty.
+        # Pre-blocked cells are filtered at variable creation; for combinations,
+        # at most 1 task var per (faculty, day, slot).
+        for (_fid, _d, _t), vars_ in self._fac_contrib.items():
+            self.model.Add(sum(vars_) <= 1)
+
+        # H6: lab room contention.
+        for (_room, _d, _t), vars_ in self._room_contrib.items():
+            self.model.Add(sum(vars_) <= 1)
+
+        # H4 lab consecutiveness / no spanning break is enforced at variable
+        # creation (lab vars only exist for legal start slots).
+
+        # H5: paired labs must run at the same (day, slot) within a section
+        # for each pair index, AND on different days across pair sessions.
+        # We have multiple LAB tasks per course; pair them by index.
+        for sec_id in self.section_ids:
+            # group tasks by paired-set: (frozenset(course, paired_with))
+            paired_groups: dict[frozenset, list[tuple[Task, dict]]] = defaultdict(list)
+            for task, vm in self._task_vars:
+                if task.section_id != sec_id or task.kind != "LAB":
+                    continue
+                if task.paired_with:
+                    key = frozenset({task.course_code, task.paired_with})
+                    paired_groups[key].append((task, vm))
+            for key, group in paired_groups.items():
+                # Split group by course code
+                by_code: dict[str, list[tuple[Task, dict]]] = defaultdict(list)
+                for t_, vm in group:
+                    by_code[t_.course_code].append((t_, vm))
+                codes = list(by_code.keys())
+                if len(codes) != 2:
+                    continue  # only enforce true pairs
+                a_list = by_code[codes[0]]
+                b_list = by_code[codes[1]]
+                n = min(len(a_list), len(b_list))
+                # Pair them up: session i of A aligns with session i of B at same (d,t)
+                for i in range(n):
+                    a_task, a_vm = a_list[i]
+                    b_task, b_vm = b_list[i]
+                    common_keys = set(a_vm.keys()) & set(b_vm.keys())
+                    # For each (d, t): a_vm[(d,t)] == b_vm[(d,t)]
+                    for k in set(a_vm.keys()) | set(b_vm.keys()):
+                        a_v = a_vm.get(k)
+                        b_v = b_vm.get(k)
+                        if a_v is not None and b_v is not None:
+                            self.model.Add(a_v == b_v)
+                        elif a_v is not None and b_v is None:
+                            self.model.Add(a_v == 0)
+                        elif b_v is not None and a_v is None:
+                            self.model.Add(b_v == 0)
+                # Sessions on different days: i!=j must be on different days
+                if n > 1:
+                    for i in range(n):
+                        for j in range(i + 1, n):
+                            ai_vm = a_list[i][1]
+                            aj_vm = a_list[j][1]
+                            for d in self.days:
+                                same_day_i = [v for (dd, _t), v in ai_vm.items() if dd == d]
+                                same_day_j = [v for (dd, _t), v in aj_vm.items() if dd == d]
+                                if same_day_i and same_day_j:
+                                    self.model.Add(sum(same_day_i) + sum(same_day_j) <= 1)
+
+        # Spread theory: same course must not appear twice on the same day in
+        # a section (this also helps S7 but is a near-hard rule in practice).
+        # Implemented as a soft hint instead in soft_constraints; keep hard
+        # behavior only when course has multiple non-lab tasks.
+        # (Optional, omitted as hard to allow tight schedules.)
+
+        # H12 faculty availability already filtered at variable creation.
+
+        # H_SLOT1: every section's slot 1 (8:30) on every active weekday must
+        # be occupied — either by a reserved cell or by a solver placement.
+        # SAT slot 1 is already locked to IIC.
+        for sec_id in self.section_ids:
+            for d in self.days:
+                if d == "SAT":
+                    continue
+                if (sec_id, d, 1) in self._reserved:
+                    continue
+                cell_vars = self._cell_contrib.get((sec_id, d, 1), [])
+                if cell_vars:
+                    self.model.Add(sum(cell_vars) >= 1)
+
+        # Faculty max_per_day (H + soft hybrid)
+        for fac in self.req.faculty:
+            cap = fac.max_per_day or 0
+            if cap <= 0:
+                continue
+            for d in self.days:
+                day_vars: list[cp_model.IntVar] = []
+                for t in self.slots:
+                    day_vars.extend(self._fac_contrib.get((fac.id, d, t), []))
+                if day_vars:
+                    self.model.Add(sum(day_vars) <= cap)
+
+    # ------------------------------------------------------------------
+    # Soft constraints
+    # ------------------------------------------------------------------
+    def _add_soft_constraints(self) -> list[cp_model.IntVar]:
+        penalties: list[cp_model.IntVar] = []
+
+        # S1 + S7: avoid same course twice on same day (in a section)
+        # Group THEORY tasks by (section, course)
+        by_sec_course: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        for task, vm in self._task_vars:
+            if task.kind == "THEORY":
+                by_sec_course[(task.section_id, task.course_code)].append(vm)
+
+        for (sec_id, code), vms in by_sec_course.items():
+            if len(vms) < 2:
+                continue
+            for d in self.days:
+                day_vars: list[cp_model.IntVar] = []
+                for vm in vms:
+                    day_vars.extend(v for (dd, _t), v in vm.items() if dd == d)
+                if len(day_vars) < 2:
+                    continue
+                # Penalize: count = sum(day_vars). Penalty = max(count - 1, 0)
+                overflow = self.model.NewIntVar(0, len(day_vars), f"of_{sec_id}_{code}_{d}")
+                self.model.Add(sum(day_vars) - 1 <= overflow)
+                penalties.append(self._scale(overflow, 10))
+
+        # S2: at most 2 high-credit (>=3) theory classes per day per section
+        high_codes = {c.code for c in self.req.courses if c.credits >= 3 and c.type == CourseType.THEORY}
+        for sec_id in self.section_ids:
+            for d in self.days:
+                day_vars: list[cp_model.IntVar] = []
+                for task, vm in self._task_vars:
+                    if task.section_id != sec_id or task.course_code not in high_codes:
+                        continue
+                    day_vars.extend(v for (dd, _t), v in vm.items() if dd == d)
+                if not day_vars:
+                    continue
+                of = self.model.NewIntVar(0, len(day_vars), f"s2_{sec_id}_{d}")
+                self.model.Add(sum(day_vars) - 2 <= of)
+                penalties.append(self._scale(of, 8))
+
+        # S3: keep post-lunch slot light (slot = lunch_after + 1)
+        post_lunch = self.tc.lunch_break.after_slot + 1
+        if post_lunch in self.slots:
+            for sec_id in self.section_ids:
+                for d in self.days:
+                    cell_vars = self._cell_contrib.get((sec_id, d, post_lunch), [])
+                    if not cell_vars:
+                        continue
+                    # penalty if any class lands there (small)
+                    pen = self.model.NewIntVar(0, 1, f"s3_{sec_id}_{d}")
+                    self.model.Add(sum(cell_vars) <= pen)
+                    penalties.append(self._scale(pen, 5))
+
+        # S6: activities prefer afternoon (slot >= post_lunch)
+        for task, vm in self._task_vars:
+            if task.kind != "ACTIVITY":
+                continue
+            morning_vars = [
+                v for (_d, t), v in vm.items()
+                if t < (self.tc.lunch_break.after_slot + 1)
+            ]
+            if morning_vars:
+                pen = self.model.NewIntVar(0, len(morning_vars), f"s6_{task.section_id}_{task.course_code}")
+                self.model.Add(sum(morning_vars) <= pen)
+                penalties.append(self._scale(pen, 2))
+
+        # S4: faculty workload balance across days.
+        # Penalize per-faculty (max_load_day - min_load_day) approximation.
+        for fac in self.req.faculty:
+            day_loads = []
+            for d in self.days:
+                day_vars: list[cp_model.IntVar] = []
+                for t in self.slots:
+                    day_vars.extend(self._fac_contrib.get((fac.id, d, t), []))
+                if not day_vars:
+                    continue
+                load = self.model.NewIntVar(0, len(day_vars), f"load_{fac.id}_{d}")
+                self.model.Add(load == sum(day_vars))
+                day_loads.append(load)
+            if len(day_loads) >= 2:
+                max_v = self.model.NewIntVar(0, 20, f"max_{fac.id}")
+                min_v = self.model.NewIntVar(0, 20, f"min_{fac.id}")
+                self.model.AddMaxEquality(max_v, day_loads)
+                self.model.AddMinEquality(min_v, day_loads)
+                spread = self.model.NewIntVar(0, 20, f"spread_{fac.id}")
+                self.model.Add(spread == max_v - min_v)
+                penalties.append(self._scale(spread, 4))
+
+        return penalties
+
+    def _scale(self, var: cp_model.IntVar, weight: int) -> cp_model.IntVar:
+        scaled = self.model.NewIntVar(0, 10000, f"sc_{var.Name()}_{weight}")
+        self.model.Add(scaled == var * weight)
+        return scaled
+
+    # ------------------------------------------------------------------
+    # Driver
+    # ------------------------------------------------------------------
+    def solve(self) -> Timetable:
+        self._apply_elective_blocks()
+        self._apply_saturday_locks()
+        self._apply_course_locks()
+        self._build_tasks()
+        self._create_variables()
+        self._add_hard_constraints()
+        penalties = self._add_soft_constraints()
+
+        if penalties:
+            self.model.Minimize(sum(penalties))
+
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = float(self.req.time_limit_sec)
+        solver.parameters.num_search_workers = 8
+        start = time.time()
+        status = solver.Solve(self.model)
+        elapsed = time.time() - start
+
+        status_name = {
+            cp_model.OPTIMAL: "OPTIMAL",
+            cp_model.FEASIBLE: "FEASIBLE",
+            cp_model.INFEASIBLE: "INFEASIBLE",
+            cp_model.MODEL_INVALID: "MODEL_INVALID",
+            cp_model.UNKNOWN: "UNKNOWN",
+        }.get(status, "UNKNOWN")
+
+        classes: list[ScheduledClass] = []
+        # Add reserved cells first
+        for sc in self._reserved.values():
+            classes.append(sc)
+
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            for task, d, t, v in self._index:
+                if solver.Value(v) == 1:
+                    classes.append(
+                        ScheduledClass(
+                            section_id=task.section_id,
+                            course_code=task.course_code,
+                            faculty_id=task.faculty_id,
+                            day=d,
+                            slot=t,
+                            is_lab=(task.kind == "LAB"),
+                            batch_id=task.batch_id,
+                            room=task.lab_room,
+                            label=task.label,
+                        )
+                    )
+                    if task.kind == "LAB":
+                        classes.append(
+                            ScheduledClass(
+                                section_id=task.section_id,
+                                course_code=task.course_code,
+                                faculty_id=task.faculty_id,
+                                day=d,
+                                slot=t + 1,
+                                is_lab=True,
+                                batch_id=task.batch_id,
+                                room=task.lab_room,
+                                label=task.label,
+                            )
+                        )
+            cost = int(solver.ObjectiveValue()) if penalties else None
+            return Timetable(
+                classes=classes,
+                status=status_name,
+                cost=cost,
+                solve_time_sec=elapsed,
+            )
+        return Timetable(
+            classes=classes,
+            status=status_name,
+            cost=None,
+            solve_time_sec=elapsed,
+            notes=[f"CP-SAT returned {status_name}"],
+        )
+
+
+def solve(req: TimetableRequest) -> Timetable:
+    return TimetableSolver(req).solve()
