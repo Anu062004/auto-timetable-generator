@@ -3,6 +3,7 @@ import { api, GenerateResponse, TimetableRequest, Violation } from './lib/api'
 import TimetableGrid from './components/TimetableGrid'
 import ChatPanel from './components/ChatPanel'
 import SetupWizard from './components/SetupWizard'
+import LandingPage from './components/LandingPage'
 
 export default function App() {
   const [req, setReq] = useState<TimetableRequest | null>(null)
@@ -14,6 +15,10 @@ export default function App() {
   const [view, setView] = useState<'section' | 'faculty'>('section')
   const [facultyId, setFacultyId] = useState<string>('')
   const [wizardOpen, setWizardOpen] = useState(false)
+  const [landing, setLanding] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true
+    return window.sessionStorage.getItem('skipLanding') !== '1'
+  })
 
   useEffect(() => {
     api
@@ -67,16 +72,38 @@ export default function App() {
           ? 'bg-rose-500'
           : 'bg-slate-400'
 
+  if (landing) {
+    return (
+      <LandingPage
+        onEnter={() => {
+          window.sessionStorage.setItem('skipLanding', '1')
+          setLanding(false)
+        }}
+      />
+    )
+  }
+
   return (
     <div className="h-screen flex flex-col bg-gradient-to-br from-slate-50 to-slate-100 text-slate-900">
       {/* Header */}
       <header className="px-5 py-3 bg-slate-900 text-white flex items-center justify-between shadow-md">
-        <div className="flex items-center gap-3">
-          <div className="h-9 w-9 rounded-md bg-indigo-500 grid place-items-center font-bold">TT</div>
+        <div
+          className="flex items-center gap-3 cursor-pointer"
+          onClick={() => {
+            window.sessionStorage.removeItem('skipLanding')
+            setLanding(true)
+          }}
+          title="Back to home"
+        >
+          <img
+            src="/bmsitm-logo.png"
+            alt="BMSITM"
+            className="h-9 w-9 rounded-md bg-white p-0.5 object-contain"
+          />
           <div>
             <div className="font-bold tracking-tight text-base">Timetable Generator</div>
             <div className="text-[11px] text-slate-300">
-              CP-SAT · BMSIT AIML 4th Sem (2025-26)
+              BMSITM · Department of AI &amp; Machine Learning
             </div>
           </div>
         </div>

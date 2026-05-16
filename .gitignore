@@ -32,9 +32,16 @@ id_ed25519
 
 # Deployment & local artifacts
 .vercel/
+.claude/
 *.db
 *.sqlite
 
 # Reports / demo outputs
 sample_output.pdf
 sample_output.xlsx
+
+# Spec / blueprint — kept locally, not pushed
+timetable_generator_blueprint.md
+
+# Server-side job store (created at runtime on the backend host)
+backend/jobs/

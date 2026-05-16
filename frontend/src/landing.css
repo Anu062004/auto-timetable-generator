@@ -1,0 +1,119 @@
+/* Landing page styles (BMSITM-themed). Scoped under .landing-root so Tailwind
+ * in the app shell doesn't bleed in. Adapted from the HTML hand-off; kept the
+ * editorial palette + Spectral / DM Sans typography. */
+
+.landing-root {
+  --navy: #0E2447;
+  --navy-2: #1C3A6E;
+  --navy-soft: #2B4577;
+  --ink: #161412;
+  --ink-2: #3A332A;
+  --muted: #6B6356;
+  --hairline: #D9CCAA;
+  --hairline-soft: #E6DCBF;
+  --beige: #F0E5C9;
+  --beige-2: #E8DAB6;
+  --cream: #F8F2E0;
+  --cream-2: #FCF7E8;
+  --paper: #FFFBED;
+  --accent: #B58A2E;
+  --l-serif: 'Spectral', Georgia, 'Times New Roman', serif;
+  --l-sans: 'DM Sans', system-ui, sans-serif;
+  --l-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  font-family: var(--l-sans);
+  color: var(--ink);
+  background: var(--cream);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  min-height: 100vh;
+}
+
+.landing-root * { box-sizing: border-box; }
+.landing-root a { color: inherit; text-decoration: none; }
+
+/* Utility strip */
+.landing-root .utility { background: var(--navy); color: #DCD2B5; font-size: 11.5px; letter-spacing: 0.06em; font-family: var(--l-sans); }
+.landing-root .utility-inner { max-width: 1280px; margin: 0 auto; padding: 9px 32px; display: flex; justify-content: space-between; align-items: center; text-transform: uppercase; }
+.landing-root .utility-left { display: flex; gap: 22px; align-items: center; }
+.landing-root .utility-left .pin { color: #C7B98A; }
+.landing-root .utility-right { display: flex; gap: 22px; align-items: center; opacity: 0.92; }
+.landing-root .utility-right a:hover { color: #fff; }
+.landing-root .utility .dot { color: #6E7DA0; }
+
+/* Masthead */
+.landing-root .masthead { border-bottom: 1px solid var(--hairline); background: var(--cream); }
+.landing-root .masthead-inner { max-width: 1280px; margin: 0 auto; padding: 22px 32px; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 28px; }
+.landing-root .brand { display: flex; align-items: center; gap: 16px; }
+.landing-root .crest { width: 54px; height: 54px; object-fit: contain; display: block; }
+.landing-root .brand-text { line-height: 1.05; }
+.landing-root .brand-title { font-family: var(--l-serif); font-weight: 600; font-size: 19px; color: var(--navy); letter-spacing: 0.01em; }
+.landing-root .brand-sub { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.18em; color: var(--muted); margin-top: 4px; }
+.landing-root .brand-rule { height: 1px; background: var(--hairline); align-self: stretch; margin: 0 8px; }
+.landing-root .mast-nav { display: flex; gap: 28px; align-items: center; font-size: 13.5px; color: var(--ink-2); }
+.landing-root .mast-nav a { position: relative; padding: 6px 0; cursor: pointer; }
+.landing-root .mast-nav a:hover { color: var(--navy); }
+.landing-root .mast-nav .active { color: var(--navy); font-weight: 500; }
+.landing-root .mast-nav .active::after { content: ""; position: absolute; left: 0; right: 0; bottom: -2px; height: 2px; background: var(--navy); }
+
+/* Hero */
+.landing-root .hero { background: var(--cream); position: relative; overflow: hidden; }
+.landing-root .hero::before {
+  content: ""; position: absolute; inset: 0;
+  background-image:
+    linear-gradient(to right, rgba(14,36,71,0.045) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(14,36,71,0.045) 1px, transparent 1px);
+  background-size: 64px 64px;
+  background-position: -1px -1px;
+  pointer-events: none;
+}
+.landing-root .hero-inner { max-width: 880px; margin: 0 auto; padding: 84px 32px 100px; display: flex; flex-direction: column; align-items: center; text-align: center; position: relative; }
+.landing-root .hero-logo { width: 260px; height: 260px; object-fit: contain; display: block; }
+.landing-root .hero-institute { font-family: var(--l-serif); font-weight: 500; color: var(--ink); font-size: clamp(28px, 3.4vw, 40px); line-height: 1.15; letter-spacing: -0.005em; margin: 28px 0 0; text-wrap: balance; }
+.landing-root .hero-institute em { font-style: italic; font-weight: 400; color: var(--navy); }
+.landing-root .hero-product { font-family: var(--l-sans); font-size: 12px; text-transform: uppercase; letter-spacing: 0.28em; color: var(--muted); margin: 18px 0 0; }
+.landing-root .hero-rule { width: 56px; height: 1.5px; background: var(--navy); margin: 28px 0 0; }
+.landing-root .hero-cta { margin-top: 36px; }
+
+/* Buttons */
+.landing-root .btn { font-family: var(--l-sans); font-size: 14px; font-weight: 500; letter-spacing: 0.01em; padding: 15px 26px; border-radius: 2px; border: 1px solid transparent; display: inline-flex; align-items: center; gap: 12px; cursor: pointer; transition: all 160ms ease; }
+.landing-root .btn-primary { background: var(--navy); color: var(--cream); border-color: var(--navy); }
+.landing-root .btn-primary:hover { background: #081938; }
+.landing-root .btn-primary .arrow { width: 22px; height: 1px; background: currentColor; position: relative; transition: width 160ms ease; }
+.landing-root .btn-primary .arrow::after { content: ""; position: absolute; right: -1px; top: -3.5px; width: 8px; height: 8px; border-right: 1px solid currentColor; border-top: 1px solid currentColor; transform: rotate(45deg); }
+.landing-root .btn-primary:hover .arrow { width: 30px; }
+.landing-root .btn-ghost { background: transparent; color: var(--ink); border-color: var(--ink-2); }
+.landing-root .btn-ghost:hover { background: var(--ink); color: var(--cream); border-color: var(--ink); }
+
+/* Ledger strip */
+.landing-root .ledger { border-top: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); background: var(--beige); }
+.landing-root .ledger-inner { max-width: 1280px; margin: 0 auto; padding: 22px 32px; display: grid; grid-template-columns: auto repeat(4, 1fr); gap: 40px; align-items: center; }
+.landing-root .ledger-label { font-family: var(--l-serif); font-style: italic; font-size: 14px; color: var(--navy); max-width: 200px; line-height: 1.3; }
+.landing-root .ledger-item { display: flex; flex-direction: column; gap: 4px; border-left: 1px solid rgba(14,36,71,0.15); padding-left: 24px; }
+.landing-root .ledger-num { font-family: var(--l-serif); font-weight: 500; font-size: 30px; color: var(--navy); line-height: 1; letter-spacing: -0.01em; }
+.landing-root .ledger-num sup { font-size: 14px; color: var(--ink-2); font-weight: 400; margin-left: 2px; }
+.landing-root .ledger-cap { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.16em; color: var(--muted); }
+
+/* Footer */
+.landing-root footer { background: var(--navy); color: #DCD2B5; padding: 38px 32px 26px; }
+.landing-root .foot-inner { max-width: 1280px; margin: 0 auto; display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 40px; align-items: start; }
+.landing-root .foot-brand { display: flex; gap: 14px; align-items: flex-start; }
+.landing-root .foot-brand img { width: 48px; height: 48px; }
+.landing-root .foot-brand .ft-name { font-family: var(--l-serif); font-size: 16px; color: #fff; line-height: 1.2; }
+.landing-root .foot-brand .ft-motto { font-family: var(--l-serif); font-style: italic; font-size: 12px; color: #9DAFCC; margin-top: 4px; }
+.landing-root .foot-col h4 { font-family: var(--l-sans); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.18em; color: #C7B98A; margin: 4px 0 14px; font-weight: 600; }
+.landing-root .foot-col ul { list-style: none; padding: 0; margin: 0; }
+.landing-root .foot-col li { margin-bottom: 8px; font-size: 12.5px; }
+.landing-root .foot-col a { cursor: pointer; }
+.landing-root .foot-col a:hover { color: #fff; }
+.landing-root .foot-rule { max-width: 1280px; margin: 30px auto 0; border-top: 1px solid rgba(255,255,255,0.10); padding-top: 18px; display: flex; justify-content: space-between; font-family: var(--l-mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #8C9EBC; }
+
+@media (max-width: 980px) {
+  .landing-root .hero-inner { padding: 44px 24px; }
+  .landing-root .ledger-inner { grid-template-columns: 1fr 1fr; }
+  .landing-root .foot-inner { grid-template-columns: 1fr 1fr; }
+  .landing-root .mast-nav { display: none; }
+  .landing-root .utility-right { display: none; }
+}

@@ -68,8 +68,55 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(BearerAuthMiddleware)
 
 
-# In-memory store keyed by job id. Production: swap for SQLite/Postgres.
+# Job store: in-memory cache + JSON files on disk so the backend can restart
+# (e.g., after `systemctl restart timetable` or a redeploy) without breaking
+# export URLs the user/HoD already has.
 _jobs: dict[str, dict] = {}
+_JOBS_DIR = Path(__file__).resolve().parent.parent / "jobs"
+_JOBS_DIR.mkdir(exist_ok=True)
+
+
+def _save_job(job_id: str, payload: dict) -> None:
+    """Persist a job to disk (best-effort)."""
+    try:
+        out = {
+            "req": payload["req"].model_dump(mode="json") if payload.get("req") else None,
+            "tt": payload["tt"].model_dump(mode="json") if payload.get("tt") else None,
+            "verify": payload["verify"].model_dump(mode="json") if payload.get("verify") else None,
+            "preflight": payload["preflight"].model_dump(mode="json") if payload.get("preflight") else None,
+        }
+        (_JOBS_DIR / f"{job_id}.json").write_text(
+            __import__("json").dumps(out), encoding="utf-8"
+        )
+    except Exception:
+        pass  # disk full / readonly fs / etc — fall back to in-memory only
+
+
+def _load_job(job_id: str) -> Optional[dict]:
+    """Look up a job: hot in-memory cache first, then disk."""
+    if job_id in _jobs:
+        return _jobs[job_id]
+    fp = _JOBS_DIR / f"{job_id}.json"
+    if not fp.exists():
+        return None
+    try:
+        raw = __import__("json").loads(fp.read_text(encoding="utf-8"))
+        from .models.domain import (
+            PreflightReport as _PR,
+            Timetable as _TT,
+            TimetableRequest as _TR,
+            VerificationReport as _VR,
+        )
+        payload = {
+            "req": _TR.model_validate(raw["req"]) if raw.get("req") else None,
+            "tt": _TT.model_validate(raw["tt"]) if raw.get("tt") else None,
+            "verify": _VR.model_validate(raw["verify"]) if raw.get("verify") else None,
+            "preflight": _PR.model_validate(raw["preflight"]) if raw.get("preflight") else None,
+        }
+        _jobs[job_id] = payload
+        return payload
+    except Exception:
+        return None
 
 
 class GenerateResponse(BaseModel):
@@ -215,7 +262,9 @@ def draft_build(body: DraftBuildRequest) -> GenerateResponse:
     pf = validate(req)
     if not pf.ok:
         job_id = uuid.uuid4().hex
-        _jobs[job_id] = {"req": req, "tt": None, "verify": None, "preflight": pf}
+        payload = {"req": req, "tt": None, "verify": None, "preflight": pf}
+        _jobs[job_id] = payload
+        _save_job(job_id, payload)
         return GenerateResponse(
             job_id=job_id, preflight=pf, timetable=None, verification=None
         )
@@ -226,7 +275,9 @@ def draft_build(body: DraftBuildRequest) -> GenerateResponse:
         else VerificationReport(ok=False)
     )
     job_id = uuid.uuid4().hex
-    _jobs[job_id] = {"req": req, "tt": tt, "verify": vr, "preflight": pf}
+    payload = {"req": req, "tt": tt, "verify": vr, "preflight": pf}
+    _jobs[job_id] = payload
+    _save_job(job_id, payload)
     return GenerateResponse(
         job_id=job_id, preflight=pf, timetable=tt, verification=vr
     )
@@ -242,19 +293,23 @@ def generate_endpoint(req: TimetableRequest) -> GenerateResponse:
     pf = validate(req)
     if not pf.ok:
         job_id = uuid.uuid4().hex
-        _jobs[job_id] = {"req": req, "tt": None, "verify": None, "preflight": pf}
+        payload = {"req": req, "tt": None, "verify": None, "preflight": pf}
+        _jobs[job_id] = payload
+        _save_job(job_id, payload)
         return GenerateResponse(job_id=job_id, preflight=pf, timetable=None, verification=None)
 
     tt = solve(req)
     vr = verify(req, tt) if tt.status in ("OPTIMAL", "FEASIBLE") else VerificationReport(ok=False)
     job_id = uuid.uuid4().hex
-    _jobs[job_id] = {"req": req, "tt": tt, "verify": vr, "preflight": pf}
+    payload = {"req": req, "tt": tt, "verify": vr, "preflight": pf}
+    _jobs[job_id] = payload
+    _save_job(job_id, payload)
     return GenerateResponse(job_id=job_id, preflight=pf, timetable=tt, verification=vr)
 
 
 @app.get("/job/{job_id}")
 def job_get(job_id: str) -> dict:
-    job = _jobs.get(job_id)
+    job = _load_job(job_id)
     if not job:
         raise HTTPException(404, "job not found")
     return {
@@ -266,7 +321,7 @@ def job_get(job_id: str) -> dict:
 
 @app.get("/job/{job_id}/export/{fmt}")
 def job_export(job_id: str, fmt: str, faculty_id: Optional[str] = None) -> Response:
-    job = _jobs.get(job_id)
+    job = _load_job(job_id)
     if not job or not job["tt"]:
         raise HTTPException(404, "job or timetable not found")
     req: TimetableRequest = job["req"]
@@ -388,7 +443,9 @@ def llm_parse(body: LLMParseRequest = Body(...)) -> JSONResponse:
                     else VerificationReport(ok=False)
                 )
                 job_id = uuid.uuid4().hex
-                _jobs[job_id] = {"req": new_req, "tt": tt, "verify": vr, "preflight": pf}
+                payload = {"req": new_req, "tt": tt, "verify": vr, "preflight": pf}
+                _jobs[job_id] = payload
+                _save_job(job_id, payload)
                 response["job_id"] = job_id
                 response["timetable"] = tt.model_dump(mode="json")
                 response["verification"] = vr.model_dump(mode="json")
@@ -410,7 +467,7 @@ class LLMExplainRequest(BaseModel):
 def llm_explain(body: LLMExplainRequest) -> dict:
     from .llm.claude_interface import ClaudeInterface
 
-    job = _jobs.get(body.job_id)
+    job = _load_job(body.job_id)
     if not job:
         raise HTTPException(404, "job not found")
     try:
