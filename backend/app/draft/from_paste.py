@@ -15,6 +15,7 @@ The paste format is intentionally forgiving and spreadsheet-friendly:
   Faculty list (after the 4th comma):
     Dr A; Dr B; ...             (one per section when the count matches sections)
     Dr A; Dr B; Dr C            (otherwise teacher pool, auto-balanced)
+    A=Dr A1 + Dr A2; B=Dr B1    (section-specific teacher pools)
     same-as=BAI402              (re-use the faculty assigned to BAI402)
     auto                        (auto-generate "<Code> Faculty X" placeholders)
     x6                          (generate 6 placeholders)
@@ -125,6 +126,7 @@ class ParsedCourse:
     locked_slots: Optional[list[int]]
     faculty_spec: str  # raw faculty list text
     is_combined: bool
+    section_faculty: dict[str, list[str]]
 
 
 def _normalise_day(s: str) -> str:
@@ -201,6 +203,7 @@ def parse_courses_text(text: str) -> list[ParsedCourse]:
                 locked_slots=locked_slots,
                 faculty_spec=faculty_spec,
                 is_combined=_parse_combined(suffix),
+                section_faculty={},
             )
         )
     return rows
@@ -211,6 +214,66 @@ def _split_faculty(spec: str) -> list[str]:
         return []
     parts = re.split(r"\s*[;|/]\s*", spec)
     return [p.strip() for p in parts if p.strip()]
+
+
+def _split_section_pool_names(spec: str) -> list[str]:
+    if not spec:
+        return []
+    parts = re.split(r"\s*(?:\+|,|&)\s*", spec)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _parse_section_key(value: str, section_ids: list[str]) -> list[str]:
+    cleaned = value.strip().upper()
+    cleaned = re.sub(r"^(?:SEC(?:TION)?|SEM(?:ESTER)?)\s*", "", cleaned).strip()
+    known = {sid.upper(): sid for sid in section_ids}
+    out: list[str] = []
+    for chunk in re.split(r"\s*(?:/|,|\+|&)\s*", cleaned):
+        key = re.sub(r"^(?:SEC(?:TION)?|SEM(?:ESTER)?)\s*", "", chunk.strip().upper()).strip()
+        if key in known and known[key] not in out:
+            out.append(known[key])
+    return out
+
+
+def _is_simple_faculty_directive(spec: str) -> bool:
+    trimmed = spec.strip().lower()
+    return trimmed == "auto" or bool(re.fullmatch(r"x\d+", trimmed)) or trimmed.startswith("same-as=")
+
+
+def parse_section_faculty_spec(spec: str, section_ids: list[str]) -> dict[str, list[str]]:
+    """Parse section pools like `A=Dr A1 + Dr A2; B=Dr B1`.
+
+    This keeps imported spreadsheets from collapsing section-specific faculty
+    into one global pool, which otherwise causes poor teacher selection.
+    """
+    if not spec or not section_ids or _is_simple_faculty_directive(spec):
+        return {}
+
+    result: dict[str, list[str]] = {}
+    found_directive = False
+    for raw_part in re.split(r"\s*[;|]\s*", spec):
+        part = raw_part.strip()
+        if not part:
+            continue
+        match = re.match(
+            r"^(?:sections?|secs?|sems?)?\s*([A-Za-z](?:\s*[/,+&]\s*[A-Za-z])*)\s*[:=]\s*(.+)$",
+            part,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        targets = _parse_section_key(match.group(1), section_ids)
+        names = _split_section_pool_names(match.group(2))
+        if not targets or not names:
+            continue
+        found_directive = True
+        for section_id in targets:
+            current = result.setdefault(section_id, [])
+            for name in names:
+                if name not in current:
+                    current.append(name)
+
+    return result if found_directive else {}
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +425,7 @@ def build_request(
                 global_teacher_loads,
                 unavailable_by_teacher(),
                 {teacher_id: fac_by_id[teacher_id].name for teacher_id in teacher_ids},
+                prefer_unused_per_subject=course.type is CourseType.LAB,
             )
         except PoolAssignmentError as e:
             raise ValueError(str(e))
@@ -373,6 +437,73 @@ def build_request(
                 is_lab=course.type is CourseType.LAB,
                 batch_id=target.batch_id,
             )
+
+    def assign_section_pools(course: ParsedCourse, pools: dict[str, list[str]]) -> None:
+        merged_names: list[str] = []
+        for names in pools.values():
+            for name in names:
+                if name not in merged_names:
+                    merged_names.append(name)
+        fallback_ids = [make_fac(name).id for name in merged_names]
+
+        for sec_id in skeleton.section_ids:
+            names = pools.get(sec_id) or merged_names
+            teacher_ids = [make_fac(name).id for name in names]
+            if not teacher_ids:
+                if course.type is CourseType.LAB:
+                    teacher_ids = [
+                        make_fac(f"{course.code} Faculty {batch_id}").id
+                        for batch_id in section_batches[sec_id]
+                    ]
+                else:
+                    teacher_ids = [make_fac(f"{course.code} Faculty {sec_id}").id]
+
+            if course.type is CourseType.LAB:
+                targets = [
+                    AssignmentTarget(
+                        section_id=sec_id,
+                        batch_id=batch_id,
+                        label=f"{course.code} batch {batch_id}",
+                    )
+                    for batch_id in section_batches[sec_id]
+                ]
+            else:
+                required_slots = (
+                    [(course.locked_day, slot) for slot in course.locked_slots or []]
+                    if course.locked_day
+                    else []
+                )
+                targets = [
+                    AssignmentTarget(
+                        section_id=sec_id,
+                        required_slots=slots_tuple(required_slots),
+                        label=f"{course.code} section {sec_id}",
+                    )
+                ]
+
+            try:
+                picked = assign_targets(
+                    teacher_ids or fallback_ids,
+                    targets,
+                    global_teacher_loads,
+                    unavailable_by_teacher(),
+                    {
+                        teacher_id: fac_by_id[teacher_id].name
+                        for teacher_id in set(teacher_ids + fallback_ids)
+                        if teacher_id in fac_by_id
+                    },
+                    prefer_unused_per_subject=course.type is CourseType.LAB,
+                )
+            except PoolAssignmentError as e:
+                raise ValueError(str(e))
+            for target, teacher_id in picked:
+                append_assignment(
+                    teacher_id,
+                    course_code=course.code,
+                    section_id=target.section_id,
+                    is_lab=course.type is CourseType.LAB,
+                    batch_id=target.batch_id,
+                )
 
     def copy_same_as(course: ParsedCourse, ref_code: str) -> None:
         refs = list(course_assignments.get(ref_code, []))
@@ -422,6 +553,10 @@ def build_request(
 
     for p in parsed:
         if p.code in elective_course_codes:
+            continue
+        section_pools = parse_section_faculty_spec(p.faculty_spec, skeleton.section_ids)
+        if section_pools:
+            assign_section_pools(p, section_pools)
             continue
         names_or_directives = _split_faculty(p.faculty_spec) or ["auto"]
 

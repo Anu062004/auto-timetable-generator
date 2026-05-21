@@ -47,6 +47,7 @@ def assign_targets(
     global_loads: MutableMapping[str, int],
     unavailable_by_teacher: Mapping[str, set[Slot]] | None = None,
     teacher_labels: Mapping[str, str] | None = None,
+    prefer_unused_per_subject: bool = False,
 ) -> list[tuple[AssignmentTarget, str]]:
     """Assign each target to the least-loaded teacher that can take it."""
     unique_teacher_ids: list[str] = []
@@ -75,14 +76,12 @@ def assign_targets(
             if overlap:
                 conflicts.append((teacher_id, overlap))
                 continue
-            candidates.append(
-                (
-                    int(global_loads.get(teacher_id, 0)),
-                    subject_loads[teacher_id],
-                    teacher_order[teacher_id],
-                    teacher_id,
-                )
-            )
+            global_load = int(global_loads.get(teacher_id, 0))
+            subject_load = subject_loads[teacher_id]
+            if prefer_unused_per_subject:
+                candidates.append((subject_load, global_load, teacher_order[teacher_id], teacher_id))
+            else:
+                candidates.append((global_load, subject_load, teacher_order[teacher_id], teacher_id))
 
         if not candidates:
             if conflicts:

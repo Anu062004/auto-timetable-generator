@@ -15,14 +15,14 @@ from xml.etree import ElementTree as ET
 import httpx
 
 from ..models.domain import CourseType
-from .from_paste import ParsedCourse, parse_courses_text
+from .from_paste import ParsedCourse, parse_courses_text, parse_section_faculty_spec
 
 _DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 _COURSE_CODE_RE = re.compile(r"\b([A-Z]{2,}[A-Z0-9_/-]*\d[A-Z0-9_/-]*)\b")
 _HEADER_LINES = [
     "# CODE, NAME, CREDITS, TYPE, FACULTY1; FACULTY2; ...",
     "# TYPE: theory | lab | lab pair=CODE | activity | activity locked=DAY:slots | combined",
-    "# Faculty: list one per section in order, or 'auto', 'xN', or 'same-as=CODE'",
+    "# Faculty: list one per section, section pools like A=Dr A1 + Dr A2; B=Dr B1, or 'auto', 'xN', 'same-as=CODE'",
     "",
 ]
 _HEADER_ALIASES = {
@@ -88,6 +88,7 @@ class DraftCourseRow:
     combined: bool = False
     faculty_directive: str = ""
     faculty_names: list[str] = field(default_factory=list)
+    section_faculty: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -102,6 +103,7 @@ class ImportedRow:
     combined: bool = False
     faculty_directive: str = ""
     faculty_names: list[str] = field(default_factory=list)
+    section_faculty: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -134,7 +136,7 @@ def import_course_documents(
     existing_text: str = "",
     replace_existing: bool = True,
 ) -> dict:
-    base_rows = [] if replace_existing else _parse_existing_rows(existing_text)
+    base_rows = [] if replace_existing else _parse_existing_rows(existing_text, section_ids)
     course_index = {row.code.upper(): row for row in base_rows if row.code.strip()}
     name_index = {_course_name_key(row.name): row for row in base_rows if row.name.strip()}
 
@@ -192,6 +194,17 @@ def import_course_documents(
         if candidate.faculty_directive:
             target.faculty_directive = candidate.faculty_directive
             target.faculty_names = []
+            target.section_faculty = {}
+        if candidate.section_faculty:
+            for section_id, names in candidate.section_faculty.items():
+                if not names:
+                    continue
+                target.section_faculty[section_id] = _merge_faculty_names(
+                    target.section_faculty.get(section_id, []),
+                    names,
+                )
+            target.faculty_directive = ""
+            imported_faculty += 1
         if candidate.faculty_names:
             target.faculty_names = _merge_faculty_names(target.faculty_names, candidate.faculty_names)
             target.faculty_directive = ""
@@ -244,18 +257,21 @@ def import_course_documents(
     }
 
 
-def _parse_existing_rows(text: str) -> list[DraftCourseRow]:
+def _parse_existing_rows(text: str, section_ids: list[str]) -> list[DraftCourseRow]:
     try:
         parsed = parse_courses_text(text)
     except Exception:
         return []
-    return [_parsed_to_draft(row) for row in parsed]
+    return [_parsed_to_draft(row, section_ids) for row in parsed]
 
 
-def _parsed_to_draft(row: ParsedCourse) -> DraftCourseRow:
+def _parsed_to_draft(row: ParsedCourse, section_ids: list[str]) -> DraftCourseRow:
     faculty_directive = row.faculty_spec.strip()
     faculty_names: list[str] = []
-    if faculty_directive and not _is_faculty_directive(faculty_directive):
+    section_faculty = parse_section_faculty_spec(faculty_directive, section_ids)
+    if section_faculty:
+        faculty_directive = ""
+    elif faculty_directive and not _is_faculty_directive(faculty_directive):
         faculty_names = _split_faculty_names(faculty_directive)
         faculty_directive = ""
     return DraftCourseRow(
@@ -269,6 +285,7 @@ def _parsed_to_draft(row: ParsedCourse) -> DraftCourseRow:
         combined=row.is_combined,
         faculty_directive=faculty_directive,
         faculty_names=faculty_names,
+        section_faculty=section_faculty,
     )
 
 
@@ -303,14 +320,20 @@ def _parse_document(filename: str, data: bytes, section_ids: list[str]) -> dict:
     seen = set()
     if ext in _SPREADSHEET_EXTENSIONS:
         for row in _parse_spreadsheet_tables(tables, section_ids):
-            key = (row.code.upper(), row.name.upper(), tuple(row.faculty_names), row.faculty_directive)
+            key = (
+                row.code.upper(),
+                row.name.upper(),
+                tuple(row.faculty_names),
+                tuple((sec, tuple(names)) for sec, names in sorted(row.section_faculty.items())),
+                row.faculty_directive,
+            )
             if key in seen:
                 continue
             seen.add(key)
             rows.append(row)
             if row.code or row.name:
                 summary.course_rows += 1
-            if row.faculty_names or row.faculty_directive:
+            if row.faculty_names or row.section_faculty or row.faculty_directive:
                 summary.faculty_rows += 1
 
         if not rows:
@@ -321,51 +344,71 @@ def _parse_document(filename: str, data: bytes, section_ids: list[str]) -> dict:
 
     for table in tables:
         for row in _parse_table_rows(table, section_ids):
-            key = (row.code.upper(), row.name.upper(), tuple(row.faculty_names))
+            key = (
+                row.code.upper(),
+                row.name.upper(),
+                tuple(row.faculty_names),
+                tuple((sec, tuple(names)) for sec, names in sorted(row.section_faculty.items())),
+            )
             if key in seen:
                 continue
             seen.add(key)
             rows.append(row)
             if row.code or row.name:
                 summary.course_rows += 1
-            if row.faculty_names:
+            if row.faculty_names or row.section_faculty:
                 summary.faculty_rows += 1
 
     line_tables = _collect_line_tables(lines)
     for table in line_tables:
         for row in _parse_table_rows(table, section_ids):
-            key = (row.code.upper(), row.name.upper(), tuple(row.faculty_names))
+            key = (
+                row.code.upper(),
+                row.name.upper(),
+                tuple(row.faculty_names),
+                tuple((sec, tuple(names)) for sec, names in sorted(row.section_faculty.items())),
+            )
             if key in seen:
                 continue
             seen.add(key)
             rows.append(row)
             if row.code or row.name:
                 summary.course_rows += 1
-            if row.faculty_names:
+            if row.faculty_names or row.section_faculty:
                 summary.faculty_rows += 1
 
     catalog_rows = _parse_course_catalog_blocks(lines)
     for row in catalog_rows:
-        key = (row.code.upper(), row.name.upper(), tuple(row.faculty_names))
+        key = (
+            row.code.upper(),
+            row.name.upper(),
+            tuple(row.faculty_names),
+            tuple((sec, tuple(names)) for sec, names in sorted(row.section_faculty.items())),
+        )
         if key in seen:
             continue
         seen.add(key)
         rows.append(row)
         if row.code or row.name:
             summary.course_rows += 1
-        if row.faculty_names:
+        if row.faculty_names or row.section_faculty:
             summary.faculty_rows += 1
 
     free_text_hits = _parse_free_text(lines)
     for row in free_text_hits:
-        key = (row.code.upper(), row.name.upper(), tuple(row.faculty_names))
+        key = (
+            row.code.upper(),
+            row.name.upper(),
+            tuple(row.faculty_names),
+            tuple((sec, tuple(names)) for sec, names in sorted(row.section_faculty.items())),
+        )
         if key in seen:
             continue
         seen.add(key)
         rows.append(row)
         if row.code or row.name:
             summary.course_rows += 1
-        if row.faculty_names:
+        if row.faculty_names or row.section_faculty:
             summary.faculty_rows += 1
 
     if not rows:
@@ -601,7 +644,12 @@ def _merge_section_matrix_table(
         if header_map.get("type") is not None:
             _apply_type_to_record(record, _value_at(row, header_map["type"]))
         for section_id, idx in header_map["section_faculty"]:
-            names = _split_faculty_names(_value_at(row, idx))
+            value = _value_at(row, idx)
+            if _is_faculty_directive(value):
+                record.faculty_directive = value.strip()
+                record.section_faculty.clear()
+                continue
+            names = _split_faculty_names(value)
             if names:
                 record.section_faculty[section_id] = _merge_faculty_names(
                     record.section_faculty.get(section_id, []),
@@ -629,7 +677,14 @@ def _merge_faculty_assignment_table(
         name = _value_at(row, header_map.get("name"))
         if _is_total_like(code, name) or (not code and not name):
             continue
-        faculty_names = _split_faculty_names(_value_at(row, faculty_idx))
+        faculty_value = _value_at(row, faculty_idx)
+        if _is_faculty_directive(faculty_value):
+            record = _record_for(records, code=code, name=name)
+            record.faculty_directive = faculty_value.strip()
+            record.section_faculty.clear()
+            continue
+
+        faculty_names = _split_faculty_names(faculty_value)
         if not faculty_names:
             continue
 
@@ -658,7 +713,8 @@ def _record_to_imported_row(record: SpreadsheetCourseRecord, section_ids: list[s
     if not record.code and not record.name:
         return None
     kind = record.kind or _infer_kind(record.name, record.code)
-    faculty_names = _faculty_for_record(record, section_ids)
+    section_faculty = _section_faculty_for_record(record, section_ids)
+    faculty_names = [] if section_faculty else _faculty_for_record(record, section_ids)
     return ImportedRow(
         code=record.code,
         name=record.name or record.code,
@@ -670,7 +726,22 @@ def _record_to_imported_row(record: SpreadsheetCourseRecord, section_ids: list[s
         combined=record.combined,
         faculty_directive=record.faculty_directive,
         faculty_names=faculty_names,
+        section_faculty=section_faculty,
     )
+
+
+def _section_faculty_for_record(record: SpreadsheetCourseRecord, section_ids: list[str]) -> dict[str, list[str]]:
+    if not record.section_faculty:
+        return {}
+    ordered_groups = [record.section_faculty.get(section_id, []) for section_id in section_ids]
+    non_empty_groups = [group for group in ordered_groups if group]
+    if len(non_empty_groups) == len(section_ids) and all(len(group) == 1 for group in non_empty_groups):
+        return {}
+    return {
+        section_id: list(record.section_faculty.get(section_id, []))
+        for section_id in section_ids
+        if record.section_faculty.get(section_id)
+    }
 
 
 def _faculty_for_record(record: SpreadsheetCourseRecord, section_ids: list[str]) -> list[str]:
@@ -1153,7 +1224,8 @@ def _parse_with_header(header_map: dict, rows: list[list[str]]) -> list[Imported
                     by_section[section_id] = names
         for section_id in _section_order(header_map["section_faculty"]):
             faculty_names.extend(by_section.get(section_id, []))
-        candidate.faculty_names = _merge_faculty_names([], faculty_names)
+        candidate.section_faculty = by_section
+        candidate.faculty_names = [] if by_section else _merge_faculty_names([], faculty_names)
 
         if not candidate.code and candidate.name:
             candidate.code = _slugify(candidate.name).upper()
@@ -1392,7 +1464,9 @@ def _serialize_rows(rows: Iterable[DraftCourseRow]) -> str:
         if row.combined:
             kind_bits.append("combined")
         faculty_spec = row.faculty_directive.strip()
-        if row.faculty_names:
+        if row.section_faculty:
+            faculty_spec = _format_section_faculty(row.section_faculty)
+        elif row.faculty_names:
             faculty_spec = "; ".join(row.faculty_names)
         elif not faculty_spec:
             faculty_spec = "auto"
@@ -1400,6 +1474,16 @@ def _serialize_rows(rows: Iterable[DraftCourseRow]) -> str:
             f"{row.code.strip()}, {row.name.strip()}, {max(0, int(row.credits))}, {' '.join(kind_bits)}, {faculty_spec}"
         )
     return "\n".join(lines)
+
+
+def _format_section_faculty(section_faculty: dict[str, list[str]]) -> str:
+    parts: list[str] = []
+    for section_id in sorted(section_faculty):
+        names = [name.strip() for name in section_faculty[section_id] if name.strip()]
+        if not names:
+            continue
+        parts.append(f"{section_id}=" + " + ".join(names))
+    return "; ".join(parts)
 
 
 def _split_tabular_line(line: str) -> Optional[list[str]]:

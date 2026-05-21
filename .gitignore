@@ -23,6 +23,7 @@ coverage/
 *.key
 id_rsa
 id_ed25519
+.backend_api_token_for_aws.txt
 
 # Editor / OS
 .DS_Store

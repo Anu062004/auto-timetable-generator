@@ -61,7 +61,7 @@ def test_import_xlsx_course_faculty_sheet_to_step2_text():
     raw_text = result["raw_text"]
     assert "BCS401, Analysis & Design of Algorithms, 3, theory, Dr A; Dr B" in raw_text
     assert "BAI402_LAB, AI Lab, 1, lab pair=BCSL404, same-as=BAI402" in raw_text
-    assert "DEPT_ACT, Dept Activity, 0, activity locked=FRI:5-7, Dept Coord" in raw_text
+    assert "DEPT_ACT, Dept Activity, 0, activity locked=FRI:5-7, A=Dept Coord" in raw_text
     assert result["summary"]["imported_courses"] == 3
 
 
@@ -139,3 +139,43 @@ def test_section_order_faculty_list_is_preserved_in_draft_request():
         if assignment.course_code == "BCS401"
     }
     assert assignments == {"A": "Dr A", "B": "Dr B"}
+
+
+def test_section_specific_faculty_pools_stay_with_their_sections():
+    skeleton = Skeleton(
+        days=["MON", "TUE"],
+        slots_per_day=4,
+        slot_timings=[
+            ("08:30", "09:25"),
+            ("09:25", "10:20"),
+            ("10:40", "11:35"),
+            ("11:35", "12:30"),
+        ],
+        tea_after_slot=2,
+        tea_minutes=20,
+        lunch_after_slot=4,
+        lunch_minutes=55,
+        section_ids=["A", "B"],
+        batches_per_section=2,
+        classroom_by_section={"A": "", "B": ""},
+        inactive_sat_weeks=[],
+        sat_locks=[],
+        semester=4,
+    )
+
+    req = build_request(
+        skeleton,
+        "BAI402_LAB, AI Lab, 1, lab, A=Dr A1 + Dr A2; B=Dr B1 + Dr B2",
+    )
+
+    assignments = {
+        (assignment.section_id, assignment.batch_id): faculty.name
+        for faculty in req.faculty
+        for assignment in faculty.assignments
+        if assignment.course_code == "BAI402_LAB"
+    }
+    assert set(assignments.values()) == {"Dr A1", "Dr A2", "Dr B1", "Dr B2"}
+    assert assignments[("A", "A1")] in {"Dr A1", "Dr A2"}
+    assert assignments[("A", "A2")] in {"Dr A1", "Dr A2"}
+    assert assignments[("B", "B1")] in {"Dr B1", "Dr B2"}
+    assert assignments[("B", "B2")] in {"Dr B1", "Dr B2"}

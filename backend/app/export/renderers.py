@@ -14,6 +14,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.platypus import (
+    Image as RLImage,
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
@@ -131,6 +132,28 @@ def _saturday_note(req: TimetableRequest) -> str:
     else:
         txt = ", ".join(parts[:-1]) + " and " + parts[-1]
     return f"Note: No Classes on {txt} Saturday of every Month"
+
+
+def _logo_path() -> Path | None:
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates = [
+        repo_root / "frontend" / "public" / "bmsitm-logo.png",
+        repo_root / "frontend" / "dist" / "bmsitm-logo.png",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _pdf_logo(size: float = 1.35 * cm):
+    logo_path = _logo_path()
+    if not logo_path:
+        return ""
+    try:
+        return RLImage(str(logo_path), width=size, height=size)
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -505,9 +528,11 @@ def _render_section_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
 
     for sec_idx, sec in enumerate(req.sections):
         effective_from = datetime.now()
+        logo = _pdf_logo()
         top_data = [
-            [_cell_paragraph("BMS INSTITUTE OF TECHNOLOGY AND MANAGEMENT", institute_style), "", ""],
+            [logo, _cell_paragraph("BMS INSTITUTE OF TECHNOLOGY AND MANAGEMENT", institute_style), "", ""],
             [
+                "",
                 _cell_paragraph(
                     "DEPARTMENT OF ARTIFICIAL INTELLIGENCE AND MACHINE LEARNING",
                     dept_style,
@@ -515,13 +540,15 @@ def _render_section_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
                 "",
                 "",
             ],
-            [_cell_paragraph("Academic Year: 2025-26 (EVEN Sem)", meta_style), "", ""],
+            ["", _cell_paragraph("Academic Year: 2025-26 (EVEN Sem)", meta_style), "", ""],
             [
+                "",
                 _cell_paragraph(sec.name, meta_style),
                 _cell_paragraph("Class Time Table", meta_style),
                 _cell_paragraph(f"Class Room: {sec.classroom or '-'}", meta_style),
             ],
             [
+                "",
                 _cell_paragraph(
                     f"With Effect From: {effective_from.day}/{effective_from.month}/{effective_from.year}",
                     meta_style,
@@ -530,15 +557,22 @@ def _render_section_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
                 _cell_paragraph("Version:01", meta_style),
             ],
         ]
-        top_tbl = Table(top_data, colWidths=[page_w * 0.28, page_w * 0.44, page_w * 0.28], hAlign="LEFT")
+        logo_w = 1.7 * cm
+        remaining_top_w = page_w - logo_w
+        top_tbl = Table(
+            top_data,
+            colWidths=[logo_w, remaining_top_w * 0.28, remaining_top_w * 0.44, remaining_top_w * 0.28],
+            hAlign="LEFT",
+        )
         top_tbl.setStyle(
             TableStyle(
                 [
                     ("GRID", (0, 0), (-1, -1), 0.8, colors.black),
                     ("BOX", (0, 0), (-1, -1), 1.1, colors.black),
-                    ("SPAN", (0, 0), (-1, 0)),
-                    ("SPAN", (0, 1), (-1, 1)),
-                    ("SPAN", (0, 2), (-1, 2)),
+                    ("SPAN", (0, 0), (0, -1)),
+                    ("SPAN", (1, 0), (-1, 0)),
+                    ("SPAN", (1, 1), (-1, 1)),
+                    ("SPAN", (1, 2), (-1, 2)),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                     ("ALIGN", (0, 0), (-1, -1), "CENTER"),
                     ("LEFTPADDING", (0, 0), (-1, -1), 2),
@@ -890,6 +924,7 @@ def _render_faculty_pdf(req: TimetableRequest, tt: Timetable, faculty_ids: list[
     faculty_label = ", ".join(faculty_names) if faculty_names else ", ".join(faculty_ids)
     course_rows = _faculty_course_rows(req, faculty_classes)
     effective_from = datetime.now()
+    logo = _pdf_logo()
     tea_range = _break_timing_template(
         req, req.time_config.tea_break.after_slot, req.time_config.tea_break.duration_min
     )
@@ -898,8 +933,9 @@ def _render_faculty_pdf(req: TimetableRequest, tt: Timetable, faculty_ids: list[
     )
 
     top_data = [
-        [_cell_paragraph("BMS INSTITUTE OF TECHNOLOGY AND MANAGEMENT", institute_style), "", ""],
+        [logo, _cell_paragraph("BMS INSTITUTE OF TECHNOLOGY AND MANAGEMENT", institute_style), "", ""],
         [
+            "",
             _cell_paragraph(
                 "DEPARTMENT OF ARTIFICIAL INTELLIGENCE AND MACHINE LEARNING",
                 dept_style,
@@ -907,13 +943,15 @@ def _render_faculty_pdf(req: TimetableRequest, tt: Timetable, faculty_ids: list[
             "",
             "",
         ],
-        [_cell_paragraph("Academic Year: 2025-26 (EVEN Sem)", meta_style), "", ""],
+        ["", _cell_paragraph("Academic Year: 2025-26 (EVEN Sem)", meta_style), "", ""],
         [
+            "",
             _cell_paragraph(faculty_label or "Faculty", meta_style),
             _cell_paragraph("Faculty Time Table", meta_style),
             _cell_paragraph(f"Courses: {len(course_rows)}", meta_style),
         ],
         [
+            "",
             _cell_paragraph(
                 f"With Effect From: {effective_from.day}/{effective_from.month}/{effective_from.year}",
                 meta_style,
@@ -922,15 +960,22 @@ def _render_faculty_pdf(req: TimetableRequest, tt: Timetable, faculty_ids: list[
             _cell_paragraph(f"Weekly Slots: {len(faculty_classes)}", meta_style),
         ],
     ]
-    top_tbl = Table(top_data, colWidths=[page_w * 0.28, page_w * 0.44, page_w * 0.28], hAlign="LEFT")
+    logo_w = 1.7 * cm
+    remaining_top_w = page_w - logo_w
+    top_tbl = Table(
+        top_data,
+        colWidths=[logo_w, remaining_top_w * 0.28, remaining_top_w * 0.44, remaining_top_w * 0.28],
+        hAlign="LEFT",
+    )
     top_tbl.setStyle(
         TableStyle(
             [
                 ("GRID", (0, 0), (-1, -1), 0.8, colors.black),
                 ("BOX", (0, 0), (-1, -1), 1.1, colors.black),
-                ("SPAN", (0, 0), (-1, 0)),
-                ("SPAN", (0, 1), (-1, 1)),
-                ("SPAN", (0, 2), (-1, 2)),
+                ("SPAN", (0, 0), (0, -1)),
+                ("SPAN", (1, 0), (-1, 0)),
+                ("SPAN", (1, 1), (-1, 1)),
+                ("SPAN", (1, 2), (-1, 2)),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("ALIGN", (0, 0), (-1, -1), "CENTER"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 2),
@@ -1119,15 +1164,7 @@ def render_pdf(req: TimetableRequest, tt: Timetable, faculty_ids: list[str] | No
 # Excel
 # ---------------------------------------------------------------------------
 def _excel_logo_path() -> Path | None:
-    repo_root = Path(__file__).resolve().parents[3]
-    candidates = [
-        repo_root / "frontend" / "public" / "bmsitm-logo.png",
-        repo_root / "frontend" / "dist" / "bmsitm-logo.png",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
+    return _logo_path()
 
 
 def _attach_excel_logo(ws, anchor: str = "A1") -> None:

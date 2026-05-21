@@ -21,7 +21,7 @@ export interface CourseDraft {
 const COURSE_HEADER_LINES = [
   '# CODE, NAME, CREDITS, TYPE, FACULTY1; FACULTY2; ...',
   '# TYPE: theory | lab | lab pair=CODE | activity | activity locked=DAY:slots | combined',
-  "# Faculty: list one per section in order, or 'auto', 'xN', or 'same-as=CODE'",
+  "# Faculty: list one per section, section pools like A=Dr A1 + Dr A2; B=Dr B1, or 'auto', 'xN', 'same-as=CODE'",
   '',
 ]
 
